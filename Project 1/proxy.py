@@ -9,11 +9,7 @@ import os
 import re
 
 class Proxy:
-    """
-    A more advanced HTTP proxy skeleton with partial buffering/parsing
-    to handle multiple/pipelined requests more cleanly.
-    """
-
+    
     REQUEST_REGEX = re.compile(
         br'^(.*?)\r\n\r\n',
         re.DOTALL
