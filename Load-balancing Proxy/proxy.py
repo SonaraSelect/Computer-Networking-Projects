@@ -9,7 +9,7 @@ import os
 import re
 
 class Proxy:
-    
+
     REQUEST_REGEX = re.compile(
         br'^(.*?)\r\n\r\n',
         re.DOTALL
@@ -132,7 +132,7 @@ class Proxy:
 
             # Check if full request
             if len(buffer) < full_length:
-                break  # The body hasn't been fully received yet
+                break
 
             # Extract complete request
             request = buffer[:full_length]
@@ -150,6 +150,7 @@ class Proxy:
         """
         client_sock = self.fd_to_socket[fd]
         try:
+            # Read next 4096 bytes of data
             chunk = client_sock.recv(4096)
             if not chunk:
                 # Close if client socket has no more data to send
@@ -158,7 +159,7 @@ class Proxy:
             self.client_buffers[fd] += chunk
 
         except ConnectionResetError:
-            # If client has connection error during reading
+            # If client has connection error during reading, close
             self._close_connection(fd)
             return
 
@@ -205,7 +206,7 @@ class Proxy:
         try:
             chunk = server_sock.recv(4096)
             if not chunk:
-                # Server is closed.
+                # Server is closed, close connection
                 self._close_connection(server_fd)
                 return
             # Write chunk to client
