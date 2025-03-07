@@ -6,25 +6,25 @@ import select
 import time
 import re
 
-REMOTE_HOST = "149.165.170.233"
-REMOTE_PORT = 80
+HOST_SERVER = "149.165.170.233"
+HOST_PORT = 80
 DEFAULT_PORT = 9000
 
-# Global throughput tracking in bytes/s
+# Global throughput tracking IN BYTES/SEC (converts later)
 global_avg_throughpyt = 0.0  
 remote_last_time = {}  # { fd: last_timestamp }
-global_alpha = 0.5     # default value; will be overwritten by command-line arg
+global_alpha = 0.5     # default alpha
 
-# Log file handle will be set from the argument.
+# Log file to be set on initialization
 log_file_handle = None
 
-# Global start time for epoll events.
+# Global start time of epoll
 epoll_start_time = None
 
 # Dictionary to track segment requests, keyed by remote socket FD.
 # Each entry contains:
 #   'start_time': when the GET was received,
-#   'header_buffer': to accumulate HTTP headers,
+#   'header_buffer': to hold HTTP headers,
 #   'header_parsed': flag indicating header completion,
 #   'expected_length': Content-Length from the response,
 #   'bytes_received': accumulated body bytes,
@@ -36,8 +36,7 @@ segment_requests = {}
 def main():
     global global_alpha, global_avg_throughpyt, log_file_handle, epoll_start_time
 
-    # Parse command-line arguments
-    # Usage: python3 proxy.py <log-file> <alpha> [<port>]
+    # python3 proxy.py <log-file> <alpha> [<port>]
     if len(sys.argv) < 2:
         print("Usage: python3 proxy.py <log-file> <alpha> [<port>]")
         sys.exit(1)
@@ -53,46 +52,46 @@ def main():
         print("Invalid or missing alpha value; using default 0.5")
         global_alpha = 0.5
 
-    # 3) Port (optional)
+    # 3) Port argument
     listen_port = DEFAULT_PORT
     if len(sys.argv) >= 4:
         listen_port = int(sys.argv[3])
 
-    # Open the log file for appending
+    # Open log file for writing
     try:
         log_file_handle = open(log_file_path, "w")
     except Exception as e:
         print(f"Error opening log file '{log_file_path}': {e}")
         sys.exit(1)
 
-    print(f"Starting proxy on port {listen_port}, forwarding to {REMOTE_HOST}:{REMOTE_PORT}")
+    print(f"Starting proxy on port {listen_port}, forwarding to {HOST_SERVER}:{HOST_PORT}")
     print(f"Using ALPHA = {global_alpha} for throughput smoothing")
     print(f"Logging final segment info to: {log_file_path}")
 
-    # Create a non-blocking server socket
+    # Create non-blocking server socket
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(("0.0.0.0", listen_port))
     server_sock.listen()
     server_sock.setblocking(False)
 
-    # Create an epoll object
+    # Create epoll object
     epoll = select.epoll()
 
-    # Record the start time for epoll events.
+    # Record start time for epoll events.
     epoll_start_time = time.time()
 
-    # Register the server socket for incoming connections
+    # Register server socket for incoming connections
     epoll.register(server_sock.fileno(), select.EPOLLIN)
 
     # Mappings:
     #   fd_to_socket: fd -> socket object
     #   fd_to_buffer: fd -> outgoing data buffer (bytes)
-    #   fd_partner:   fd -> partner fd (client <--> remote)
+    #   fd_group:     fd -> group fd (client <--> remote)
     #   fd_role:      fd -> 'client' or 'remote'
     fd_to_socket = {server_sock.fileno(): server_sock}
     fd_to_buffer = {}
-    fd_partner   = {}
+    fd_group   = {}
     fd_role      = {}
 
     try:
@@ -110,44 +109,44 @@ def main():
                     fd_to_buffer[client_sock.fileno()] = b""
                     fd_role[client_sock.fileno()] = 'client'
 
-                    # Create a socket to connect to the remote server
+                    # Make a socket that connects to hosting server
                     remote_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     remote_sock.setblocking(False)
                     try:
-                        remote_sock.connect((REMOTE_HOST, REMOTE_PORT))
+                        remote_sock.connect((HOST_SERVER, HOST_PORT))
                     except BlockingIOError:
-                        pass  # Non-blocking connect in progress
+                        pass  # Non-blocking connection is in progress
 
                     epoll.register(remote_sock.fileno(), select.EPOLLIN | select.EPOLLOUT)
                     fd_to_socket[remote_sock.fileno()] = remote_sock
                     fd_to_buffer[remote_sock.fileno()] = b""
                     fd_role[remote_sock.fileno()] = 'remote'
 
-                    # Initialize throughput measurement for this remote socket
+                    # Start throughput measurement
                     remote_last_time[remote_sock.fileno()] = time.time()
 
-                    # Cross-reference the partner FDs
-                    fd_partner[client_sock.fileno()] = remote_sock.fileno()
-                    fd_partner[remote_sock.fileno()] = client_sock.fileno()
+                    # Cross-reference the group file descriptors
+                    fd_group[client_sock.fileno()] = remote_sock.fileno()
+                    fd_group[remote_sock.fileno()] = client_sock.fileno()
 
                 else:
                     sock = fd_to_socket[fd]
-                    partner_fd = fd_partner.get(fd)
+                    group_fd = fd_group.get(fd)
 
                     if event & select.EPOLLIN:
                         try:
                             data = sock.recv(4096)
                             if data:
                                 if fd_role.get(fd) == 'client':
-                                    # Process client data: handle GET requests (modify manifest if needed)
-                                    data = handle_client_data(data, fd, fd_partner)
+                                    # Process client GET requests; analyze segment and intercept manifest
+                                    data = handle_client_data(data, fd, fd_group)
                                 elif fd_role.get(fd) == 'remote':
                                     # Update throughput measurements
                                     now = time.time()
                                     last_time = remote_last_time.get(fd, now)
                                     dt = now - last_time
                                     if dt > 0:
-                                        measured = len(data) / dt  # in bytes/s
+                                        measured = len(data) / dt  # IN BYTES/SEC -- will be converted later!!
                                         global_avg_throughpyt = (
                                             global_alpha * measured +
                                             (1 - global_alpha) * global_avg_throughpyt
@@ -156,13 +155,13 @@ def main():
 
                                     if fd in segment_requests:
                                         process_segment_data(fd, data, now)
-                                # Forward (possibly modified) data to the partner.
-                                fd_to_buffer[partner_fd] += data
-                                epoll.modify(partner_fd, select.EPOLLIN | select.EPOLLOUT)
+                                # Forward (possibly modified) data to the groupmember.
+                                fd_to_buffer[group_fd] += data
+                                epoll.modify(group_fd, select.EPOLLIN | select.EPOLLOUT)
                             else:
-                                close_connection(epoll, fd, fd_partner, fd_to_socket, fd_to_buffer, fd_role)
+                                close_connection(epoll, fd, fd_group, fd_to_socket, fd_to_buffer, fd_role)
                         except ConnectionResetError:
-                            close_connection(epoll, fd, fd_partner, fd_to_socket, fd_to_buffer, fd_role)
+                            close_connection(epoll, fd, fd_group, fd_to_socket, fd_to_buffer, fd_role)
 
                     if event & select.EPOLLOUT:
                         if fd_to_buffer[fd]:
@@ -170,13 +169,13 @@ def main():
                                 sent = sock.send(fd_to_buffer[fd])
                                 fd_to_buffer[fd] = fd_to_buffer[fd][sent:]
                             except ConnectionResetError:
-                                close_connection(epoll, fd, fd_partner, fd_to_socket, fd_to_buffer, fd_role)
+                                close_connection(epoll, fd, fd_group, fd_to_socket, fd_to_buffer, fd_role)
                                 continue
                         if not fd_to_buffer[fd]:
                             epoll.modify(fd, select.EPOLLIN)
 
                     if event & (select.EPOLLHUP | select.EPOLLERR):
-                        close_connection(epoll, fd, fd_partner, fd_to_socket, fd_to_buffer, fd_role)
+                        close_connection(epoll, fd, fd_group, fd_to_socket, fd_to_buffer, fd_role)
     finally:
         epoll.unregister(server_sock.fileno())
         epoll.close()
@@ -184,12 +183,9 @@ def main():
         if log_file_handle:
             log_file_handle.close()
 
-def handle_client_data(data_chunk, client_fd, fd_partner):
+def handle_client_data(data_chunk, client_fd, fd_group):
     """
-    Process data from the client:
-      - Split by CRLF and check for lines starting with 'GET '.
-      - If the URL contains 'manifest.mpd', replace it.
-      - Otherwise, parse segment info from the last path component.
+    Search client requests for manifest file or segment data
     """
     lines = data_chunk.split(b"\r\n")
     new_lines = []
@@ -205,14 +201,14 @@ def handle_client_data(data_chunk, client_fd, fd_partner):
                     line = b' '.join(parts)
                     print(f"[INFO] Replacing manifest request with: {new_url}")
                 else:
-                    # Parse segment info from the last path component.
+                    # Rip chunk name from last bit of URL for segment request
                     stripped = url.lstrip('/')
-                    last_part = stripped.rsplit('/', 1)[-1]  # e.g., "500seg1"
+                    last_part = stripped.rsplit('/', 1)[-1]  # Extracts "500seg1"
                     m = re.match(r"(\d+)(.+)", last_part)
                     if m:
                         bitrate = m.group(1)
                         chunkname = last_part
-                        remote_fd = fd_partner.get(client_fd)
+                        remote_fd = fd_group.get(client_fd)
                         if remote_fd is not None:
                             segment_requests[remote_fd] = {
                                 'start_time': time.time(),
@@ -231,13 +227,7 @@ def handle_client_data(data_chunk, client_fd, fd_partner):
 
 def process_segment_data(remote_fd, data, now):
     """
-    Accumulate HTTP response data for the segment request on remote_fd.
-    Once the full segment is received, log a line to the file in the format:
-      <time_since_epoll> <duration> <measured_Kbps> <smoothed_Kbps> <bitrate> <chunkname>
-    where:
-      - <time_since_epoll> = now - epoll_start_time
-      - <duration> = now - segment start time
-      - Throughput values are in kilobits per second.
+    Parse GET requests for Segment to mark when to measure and mark appropriate data for log
     """
     global segment_requests, global_avg_throughpyt, log_file_handle, epoll_start_time
     seg = segment_requests[remote_fd]
@@ -248,7 +238,7 @@ def process_segment_data(remote_fd, data, now):
             header, body = seg['header_buffer'].split(b"\r\n\r\n", 1)
             seg['header_parsed'] = True
             seg['bytes_received'] += len(body)
-            # Extract Content-Length, if available.
+            # Extract Content-Length if we can
             for line in header.split(b"\r\n"):
                 if line.lower().startswith(b"content-length:"):
                     try:
@@ -264,7 +254,7 @@ def process_segment_data(remote_fd, data, now):
         duration = now - seg['start_time']
         current_throughput = seg['bytes_received'] / duration if duration > 0 else 0.0
 
-        # Convert throughput values to Kbps (bytes/s * 8 / 1000).
+        # Convert throughput values to Kbps from Bps
         current_throughput_kbps = current_throughput * 8 / 1000
         avg_throughput_kbps = global_avg_throughpyt * 8 / 1000
 
@@ -272,9 +262,9 @@ def process_segment_data(remote_fd, data, now):
 
         log_line = (
             f"{time_since_epoll:.3f} "  # seconds since epoll started
-            f"{duration:.3f} "          # duration in seconds to download the chunk
-            f"{current_throughput_kbps:.3f} "  # measured throughput in Kbps
-            f"{avg_throughput_kbps:.3f} "  # smoothed throughput in Kbps
+            f"{duration:.3f} "          # duration of chunk download
+            f"{current_throughput_kbps:.3f} "  # current throughput in (kbps)
+            f"{avg_throughput_kbps:.3f} "  # average throughput in (kbps)
             f"{seg['bitrate']} "
             f"{seg['chunkname']}\n"
         )
@@ -284,28 +274,25 @@ def process_segment_data(remote_fd, data, now):
 
         seg['logged'] = True
 
-def close_connection(epoll, fd, fd_partner, fd_to_socket, fd_to_buffer, fd_role):
-    """
-    Cleanly close a socket and its partner and remove associated tracking data.
-    """
-    if fd in fd_partner:
-        partner_fd = fd_partner[fd]
-        if partner_fd in fd_partner:
-            del fd_partner[partner_fd]
-        fd_partner.pop(fd, None)
+def close_connection(epoll, fd, fd_group, fd_to_socket, fd_to_buffer, fd_role):
+    if fd in fd_group:
+        group_fd = fd_group[fd]
+        if group_fd in fd_group:
+            del fd_group[group_fd]
+        fd_group.pop(fd, None)
 
-        if partner_fd in fd_to_socket:
+        if group_fd in fd_to_socket:
             try:
-                epoll.unregister(partner_fd)
+                epoll.unregister(group_fd)
             except Exception:
                 pass
-            fd_to_socket[partner_fd].close()
-            del fd_to_socket[partner_fd]
-            fd_to_buffer.pop(partner_fd, None)
-            fd_role.pop(partner_fd, None)
-            remote_last_time.pop(partner_fd, None)
-            if partner_fd in segment_requests:
-                del segment_requests[partner_fd]
+            fd_to_socket[group_fd].close()
+            del fd_to_socket[group_fd]
+            fd_to_buffer.pop(group_fd, None)
+            fd_role.pop(group_fd, None)
+            remote_last_time.pop(group_fd, None)
+            if group_fd in segment_requests:
+                del segment_requests[group_fd]
 
     try:
         epoll.unregister(fd)
