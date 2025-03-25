@@ -1,8 +1,10 @@
+import enum
 import socket
 import struct
 import threading
 import time  
 from grading import MSS, DEFAULT_TIMEOUT
+from enum import Enum, auto
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -39,18 +41,23 @@ class Packet:
         return Packet(seq, ack, flags, payload)
 
 
+    
+
 class TransportSocket:
     def __init__(self):
         self.sock_fd = None
 
         # Locks and condition
-        self.recv_lock = threading.Lock()
-        self.send_lock = threading.Lock()
-        self.wait_cond = threading.Condition(self.recv_lock)
+        self.recv_lock = threading.Lock()                    # synchronize
+        self.send_lock = threading.Lock()                    # synchronize 
+        self.wait_cond = threading.Condition(self.recv_lock) # synchronize back end and main process
 
         self.death_lock = threading.Lock()
         self.dying = False
         self.thread = None
+
+        # Internal state
+        ## self.state = STATE
 
         self.window = {
             "last_ack": 0,            # The next seq we expect from peer (used for receiving data)
@@ -62,6 +69,8 @@ class TransportSocket:
         self.sock_type = None
         self.conn = None
         self.my_port = None
+
+    
 
     def socket(self, sock_type, port, server_ip=None):
         """
@@ -216,6 +225,8 @@ class TransportSocket:
 
             return True
 
+
+    # todo this will run in its own thread
     def backend(self):
         """
         Backend loop to handle receiving data and sending acknowledgments.
