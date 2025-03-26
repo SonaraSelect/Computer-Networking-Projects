@@ -316,4 +316,140 @@ class TransportSocket:
                     # Expecting a SYN from a client
                     if syn and not ack:
                         # We got a SYN, go to SYN_RCVD, send SYN+ACK
-                        self.state = ConnectionState
+                        self.state = ConnectionState.SYN_RCVD
+                        self.window["last_ack"] = packet.seq + 1
+                        self.send_syn_ack()
+                        print("Transition LISTEN -> SYN_RCVD")
+                    else:
+                        print("Unexpected packet in LISTEN state.")
+
+                elif self.state == ConnectionState.SYN_SENT:
+                    # We sent SYN, expect a SYN+ACK
+                    if syn and ack:
+                        # This is SYN+ACK. We ack it and go to ESTABLISHED
+                        self.window["next_seq_expected"] = packet.ack
+                        self.window["last_ack"] = packet.seq + 1
+                        self.send_ack(self.window["last_ack"])
+                        self.state = ConnectionState.ESTABLISHED
+                        print("Transition SYN_SENT -> ESTABLISHED")
+                    else:
+                        print("Unexpected packet in SYN_SENT state.")
+
+                elif self.state == ConnectionState.SYN_RCVD:
+                    # We are waiting for an ACK of our SYN+ACK
+                    if ack and packet.ack >= self.window["next_seq_to_send"]:
+                        # The client acked our SYN+ACK
+                        self.window["next_seq_expected"] = packet.ack
+                        self.state = ConnectionState.ESTABLISHED
+                        print("Transition SYN_RCVD -> ESTABLISHED")
+                    else:
+                        print("Unexpected packet in SYN_RCVD state.")
+
+                elif self.state == ConnectionState.ESTABLISHED:
+                    # Normal data exchange or close requests
+                    if fin:
+                        # Peer is closing -> we go to CLOSE_WAIT
+                        print("Received FIN in ESTABLISHED, sending ACK -> CLOSE_WAIT")
+                        ack_val = packet.seq + 1
+                        self.send_ack(ack_val)
+                        self.window["last_ack"] = ack_val
+                        self.state = ConnectionState.CLOSE_WAIT
+                    elif ack:
+                        # Possibly an ACK for our data
+                        if packet.ack > self.window["next_seq_expected"]:
+                            self.window["next_seq_expected"] = packet.ack
+                            # Remove acknowledged segments
+                            for s in list(self.unacked_segments.keys()):
+                                if s < packet.ack:
+                                    del self.unacked_segments[s]
+                            self.wait_cond.notify_all()
+                    else:
+                        # Could be data
+                        self.handle_incoming_data(packet)
+
+                elif self.state == ConnectionState.FIN_SENT:
+                    # We did an active close; waiting for ACK or FIN+ACK
+                    if ack and packet.ack >= self.window["next_seq_to_send"]:
+                        # Our FIN was acked -> TIME_WAIT
+                        print("FIN acknowledged. Transition -> TIME_WAIT")
+                        self.state = ConnectionState.TIME_WAIT
+                        # Remove FIN from unacked
+                        for s in list(self.unacked_segments.keys()):
+                            if s < packet.ack:
+                                del self.unacked_segments[s]
+                    elif fin:
+                        # The peer also closed, we should ACK
+                        ack_val = packet.seq + 1
+                        self.send_ack(ack_val)
+                        # This is a simultaneous close scenario
+                        print("Simultaneous close; going to TIME_WAIT")
+                        self.state = ConnectionState.TIME_WAIT
+                    else:
+                        # Could be data or an out-of-order ack
+                        self.handle_incoming_data(packet)
+
+                elif self.state == ConnectionState.CLOSE_WAIT:
+                    # We have received a FIN, waiting for local app to call close()
+                    # If the local app calls close(), we send FIN and go to LAST_ACK
+                    if ack:
+                        # Possibly acking something, but we’re waiting for our FIN
+                        # No transition unless we had already sent a FIN
+                        if packet.ack > self.window["next_seq_expected"]:
+                            self.window["next_seq_expected"] = packet.ack
+                            for s in list(self.unacked_segments.keys()):
+                                if s < packet.ack:
+                                    del self.unacked_segments[s]
+                    else:
+                        # Could be data
+                        self.handle_incoming_data(packet)
+
+                elif self.state == ConnectionState.LAST_ACK:
+                    # We’ve sent a FIN in response to a FIN. Next step is ack of our FIN -> CLOSED
+                    if ack and packet.ack >= self.window["next_seq_to_send"]:
+                        print("Received ACK for our FIN, transitioning -> CLOSED")
+                        self.state = ConnectionState.CLOSED
+                        self.dying = True
+                    else:
+                        # Could be data or out-of-order
+                        self.handle_incoming_data(packet)
+
+                elif self.state == ConnectionState.TIME_WAIT:
+                    # We handle it at top of loop. 
+                    pass
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not self.dying:
+                    print(f"Error in backend: {e}")
+
+        # After loop ends, close resources
+        if self.sock_fd:
+            self.sock_fd.close()
+        self.state = ConnectionState.CLOSED
+        print("Socket closed. State=CLOSED")
+
+    def handle_incoming_data(self, packet):
+        """
+        Handle in-order data reception in ESTABLISHED or other states that accept data.
+        """
+        if packet.seq == self.window["last_ack"]:
+            with self.recv_lock:
+                # Check for buffer space
+                if self.window["recv_len"] + len(packet.payload) > MAX_NETWORK_BUFFER:
+                    print("Receive buffer full. Dropping packet.")
+                    # Possibly send ACK with window=0, if you want real flow control
+                else:
+                    self.window["recv_buf"] += packet.payload
+                    self.window["recv_len"] += len(packet.payload)
+                    self.window["last_ack"] = packet.seq + len(packet.payload)
+                    with self.wait_cond:
+                        self.wait_cond.notify_all()
+                    print(f"Received data: seq={packet.seq}, length={len(packet.payload)}")
+            # Send an ACK for the newly received data
+            self.send_ack(self.window["last_ack"])
+        else:
+            # Out-of-order or repeated data
+            print(f"Out-of-order or duplicate data: seq={packet.seq}, expected={self.window['last_ack']}")
+            # Real TCP might send a dup ACK here.
+
