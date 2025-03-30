@@ -78,6 +78,7 @@ class TransportSocket:
 
         # my additions -----------
         self.state = State.LISTEN
+        self.close_timer = None
         self.data_buffer = []
 
 
@@ -138,6 +139,15 @@ class TransportSocket:
         """
         Close the socket and stop the backend thread.
         """
+        print("CLOSED")
+        # self.state = State.CLOSED # <------------------------------------
+        self.send_fin_packet()
+
+        # Wait until CLOSED or timeout
+        with self.wait_cond:
+            self.wait_cond.wait_for(lambda: self.state == State.CLOSED, timeout=1)
+
+
         self.death_lock.acquire()
         try:
             self.dying = True
@@ -153,6 +163,7 @@ class TransportSocket:
             print("Error: Null socket")
             return EXIT_ERROR
 
+        print("BACKEND FULLY CLOSED")
         return EXIT_SUCCESS
 
     def send(self, data):
@@ -168,6 +179,9 @@ class TransportSocket:
                 self.send_syn_packet()
             
             self.send_segment(data)
+
+            # Finished sending. Send FIN
+            # self.send_fin_packet()
 
     # def send_syn_packet(self):
     #     seq_no = self.window["next_seq_to_send"]
@@ -234,7 +248,7 @@ class TransportSocket:
             self.sock_fd.sendto(fin.encode(), self.conn)
             with self.wait_cond:
                 self.wait_cond.wait_for(lambda: self.state == State.TIME_WAIT, timeout=DEFAULT_TIMEOUT)
-        print(f"==> ESTABLISHED Sending FIN segment {seq_no}, size {len(payload)} transitioning to ")            
+        print(f"==> ESTABLISHED Sending FIN segment {seq_no}, size {len(payload)} transitioning to FIN_SENT")            
             
 
 
@@ -319,11 +333,6 @@ class TransportSocket:
 
                 offset += payload_len
 
-        # In this case we should be either SYN_RCVD or ESTABLISHED
-        print("Finished sending data to client!")
-
-
-
 
     def wait_for_ack(self, ack_goal):
         """
@@ -356,16 +365,23 @@ class TransportSocket:
         """
         while not self.dying:
             try:
+
+                # Handle death timers
+                if self.state == State.TIME_WAIT or self.state == State.CLOSE_WAIT:
+                    if not self.close_timer:
+                        self.close_timer = time.time()
+
+                    if time.time() - self.close_timer > 0.05:
+                        self.state = State.CLOSED
+                        print(f"{self.state} Now closing...")
+
+
                 data, addr = self.sock_fd.recvfrom(2048)
                 packet = Packet.decode(data)
 
                 # If no peer is set, establish connection (for listener)
                 if self.conn is None:
                     self.conn = addr
-
-                # # If it's a SYN packet and we are listening ------------------<<
-                # if (packet.flags & SYN_FLAG) != 0 and self.state == State.LISTEN:
-
 
                 match(self.state):
                     case(State.LISTEN):
@@ -414,7 +430,7 @@ class TransportSocket:
 
 
                     case(State.SYN_RCVD):
-                        if(packet.flags & ACK_FLAG):
+                        if packet.flags & ACK_FLAG != 0:
                             with self.recv_lock:
                                 print("==> SYN_RCVD Received ACK, trans. to ESTABLISHED")
 
@@ -423,6 +439,18 @@ class TransportSocket:
                                 continue
 
                     case(State.ESTABLISHED):
+
+                        # If it's a FIN packet, transition to CLOSE_WAIT
+                        if packet.flags & FIN_FLAG != 0:
+                            with self.recv_lock:
+                                print("==> ESTABLISHED received FIN transitioning to CLOSE_WAIT")
+                                self.send_ack(packet, ACK_FLAG, addr)
+                                
+                                self.state = State.CLOSE_WAIT
+                                self.wait_cond.notify_all()
+                                continue
+
+
                         # If it's an ACK packet, update our sending side
                         if (packet.flags & ACK_FLAG) != 0:
                             with self.recv_lock:
@@ -458,15 +486,92 @@ class TransportSocket:
                             # buffer ordered by seq num
 
                     case(State.FIN_SENT):
+                        # If we get an ACK packet, transition to TIME_WAIT
+                        if packet.flags & ACK_FLAG:
+                            with self.recv_lock:
+                                print("==> {self.State} FIN_SENT Received ACK, transitioning to TIME_WAIT")
+
+                                self.state = State.TIME_WAIT
+                                self.wait_cond.notify_all()
+                                continue
+                        # If we get a FIN packet, send ack and transition to TIME_WAIT
+                        if packet.flags & FIN_FLAG != 0:
+                            with self.recv_lock:
+                                print("==> {self.State} FIN_SENT Received FIN_FLAG, send ACK then transitioning to TIME_WAIT")
+                                self.send_ack(packet, ACK_FLAG, addr)
+
+                                self.state = State.TIME_WAIT
+                                self.wait_cond.notify_all()
+                                continue
+
+                        if packet.flags & 0x00 != 0:
+                            with self.recv_lock:
+                                print("======> FIN_SENT Received data packet. Transitioning to ESTABLISHED")
+
+
+                                if packet.seq == self.window["last_ack"]:
+                                    with self.recv_lock:
+                                        # Append payload to our receive buffer
+                                        self.window["recv_buf"] += packet.payload
+                                        self.window["recv_len"] += len(packet.payload)
+
+                                    with self.wait_cond:
+                                        self.wait_cond.notify_all()
+
+                                    print(f"Received segment {packet.seq} with {len(packet.payload)} bytes.")
+
+                                # Send back an acknowledgment & Update last ACK
+                                self.send_ack(packet, ACK_FLAG, addr)
+
+
+                                self.state = State.ESTABLISHED
+                                self.wait_cond.notify_all()
+                                continue
 
                     case(State.TIME_WAIT):
+                        # todo make this state also go to CLOSED automatically
+                        # If we get a FIN packet, send ACK and transition to CLOSED
+                        if packet.flags & FIN_FLAG != 0:
+                            with self.recv_lock:
+                                # print("==> FIN_SENT Received FIN_FLAG, send ACK then transitioning to TIME_WAIT")
+                                # self.send_ack(packet, ACK_FLAG, addr)
 
+                                # self.state = State.CLOSED
+                                # self.wait_cond.notify_all()
+                                # continue
+
+                                if not self.close_timer:
+                                    self.close_timer = time.time()
+                                elif time.time() - self.close_timer > 0.05:
+                                    with self.recv_lock:
+                                        self.state = State.CLOSED
+                                        self.wait_cond.notify_all()
+                                                    
                     case(State.CLOSE_WAIT):
+                        # todo make automatically go to CLOSED
+                        # If it's an ACK packet, update our sending side
+                        if (packet.flags & ACK_FLAG) != 0:
+                            with self.recv_lock:
+                                if packet.ack > self.window["next_seq_expected"]:
+                                    self.window["next_seq_expected"] = packet.ack
+                                
+                                self.wait_cond.notify_all()
+                                continue
 
                     case(State.LAST_ACK):
+                        if packet.flags * ACK_FLAG !=0:
+                            with self.recv_lock:
+                                print("==> LACT_ACK Received ACK. transitioning to CLOSED")
+                                
+                                # self.close() # <------- do this? <----------
+
+                                self.state = State.CLOSED
+                                self.wait_cond.notify_all()
+                                continue
 
                     case(State.CLOSED):
-                        break
+                        print("==> CLOSED Connection has closed.")
+                        continue
 
                     
 
