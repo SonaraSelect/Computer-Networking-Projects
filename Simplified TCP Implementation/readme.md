@@ -34,3 +34,6 @@ Default values include:
 - self.RTT = DEFAULT_TIMEOUT
 
 ## PYTHON 3 IS NEEDED TO RUN MY CODE !!
+Run on Ubuntu 24.04.1 LTS on WSL2
+Kernel: 5.15.167.4-microsoft-standard-WSL2
+(alternate kernel needed to simulate network congestion)
