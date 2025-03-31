@@ -1,7 +1,6 @@
 import os
 import random
 import string
-import time
 from transport import TransportSocket, ReadMode
 
 def generate_random_data(size):
@@ -33,7 +32,6 @@ def client_main():
     client_socket.recv(buf, 1024, flags=ReadMode.NO_FLAG)
     print(f"Client: Received data from server:\n{buf[0].decode()}")
 
-    time.sleep(10)
     # Close the client socket
     client_socket.close()
 
