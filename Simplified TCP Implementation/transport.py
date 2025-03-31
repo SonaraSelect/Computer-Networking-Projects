@@ -81,12 +81,10 @@ class TransportSocket:
         self.close_timer = None
         self.data_buffer = []
 
-        self.smoothed_rtt = DEFAULT_TIMEOUT      # Initial Smoothed RTT
+        self.est_rtt = DEFAULT_TIMEOUT           # Initial Estimated RTT
         self.alpha = 0.5                         # Alpha value between 0 and 1
         self.RTT = DEFAULT_TIMEOUT               # Initial retransmission timeout
         self.packet_send_times = {}              # Tracker of when each packet was sent
-
-
 
 
     def add_to_buffer(self, packet):
@@ -376,12 +374,12 @@ class TransportSocket:
                 del self.packet_send_times[ack_goal]
 
                 # Update moothed_rtt with EWMA:
-                # smoothed_rtt = alpha * smoothed_rtt + (1 - alpha) * sample_rtt
-                self.smoothed_rtt = self.alpha * self.smoothed_rtt + (1.0 - self.alpha) * sample_rtt
+                # est_rtt = alpha * est_rtt + (1 - alpha) * sample_rtt
+                self.est_rtt = self.alpha * self.est_rtt + (1.0 - self.alpha) * sample_rtt
 
-                # Optionally set your timeout as some multiple of smoothed_rtt (e.g., 2 * smoothed_rtt)
-                self.timeout = 2 * self.smoothed_rtt
-                print(f"Updated RTT: sample={sample_rtt:.4f}, smoothed_rtt={self.smoothed_rtt:.4f}, timeout={self.timeout:.4f}")
+                # Optionally set your timeout as some multiple of est_rtt (e.g., 2 * est_rtt)
+                self.timeout = 2 * self.est_rtt
+                print(f"Updated RTT: sample={sample_rtt:.4f}, est_rtt={self.est_rtt:.4f}, timeout={self.timeout:.4f}")
             return True
         
     def send_ack(self, packet, flags, addr):
@@ -404,7 +402,7 @@ class TransportSocket:
                     if not self.close_timer:
                         self.close_timer = time.time()
 
-                    if time.time() - self.close_timer > 0.05:
+                    if time.time() - self.close_timer > 2 * self.est_rtt:
                         self.state = State.CLOSED
                         print(f"{self.state} Now closing...")
                         # self.close()
