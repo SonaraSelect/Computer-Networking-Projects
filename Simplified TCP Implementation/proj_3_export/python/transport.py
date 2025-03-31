@@ -81,6 +81,13 @@ class TransportSocket:
         self.close_timer = None
         self.data_buffer = []
 
+        self.smoothed_rtt = DEFAULT_TIMEOUT      # Initial Smoothed RTT
+        self.alpha = 0.5                         # Alpha value between 0 and 1
+        self.RTT = DEFAULT_TIMEOUT               # Initial retransmission timeout
+        self.packet_send_times = {}              # Tracker of when each packet was sent
+
+
+
 
     def add_to_buffer(self, packet):
         """
@@ -328,6 +335,9 @@ class TransportSocket:
                 # We expect an ACK for seq_no + payload_len
                 ack_goal = seq_no + payload_len
 
+                # Record time packet is sent
+                self.packet_send_times[ack_goal] = time.time()
+
                 while True:
                     print(f"Sending segment (seq={seq_no}, len={payload_len})")
                     self.sock_fd.sendto(segment.encode(), self.conn)
@@ -358,6 +368,20 @@ class TransportSocket:
 # 
                 self.wait_cond.wait(timeout=remaining)
 
+            # ACK has been received, now calculate RTT
+            send_time = self.packet_send_times.get(ack_goal, None)
+            if send_time is not None:
+                sample_rtt = time.time() - send_time
+                # Remove it from the dict so we don't reuse it
+                del self.packet_send_times[ack_goal]
+
+                # Update moothed_rtt with EWMA:
+                # smoothed_rtt = alpha * smoothed_rtt + (1 - alpha) * sample_rtt
+                self.smoothed_rtt = self.alpha * self.smoothed_rtt + (1.0 - self.alpha) * sample_rtt
+
+                # Optionally set your timeout as some multiple of smoothed_rtt (e.g., 2 * smoothed_rtt)
+                self.timeout = 2 * self.smoothed_rtt
+                print(f"Updated RTT: sample={sample_rtt:.4f}, smoothed_rtt={self.smoothed_rtt:.4f}, timeout={self.timeout:.4f}")
             return True
         
     def send_ack(self, packet, flags, addr):
