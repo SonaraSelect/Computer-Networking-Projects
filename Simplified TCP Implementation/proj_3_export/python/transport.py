@@ -316,46 +316,50 @@ class TransportSocket:
         return read_len
 
     def send_segment(self, data):
-        """
-        Send 'data' in multiple MSS-sized segments and reliably wait for each ACK.
-        If the connection state is no longer ESTABLISHED (e.g., we've entered CLOSE_WAIT),
-        stop sending further segments.
-        """
+
+        if self.state != State.ESTABLISHED:
+            print(f"==> {self.state} Error: tried to send data when not in ESTABLISHED.")
+            return
+
+
         offset = 0
         total_len = len(data)
 
-        # While there's data left to send
         while offset < total_len:
-            # If the connection is no longer fully open, abort sending additional data.
-            if self.state != State.ESTABLISHED:
-                print("Connection is no longer ESTABLISHED. Stopping send_segment.")
-                return
+            # Wait if peer_window is 0
+            while self.peer_window == 0:
+                print("Peer window is 0, waiting for it to open...")
+                with self.wait_cond:
+                    self.wait_cond.wait(timeout=1.0)
+                    # Then check peer_window again
 
-            payload_len = min(MSS, total_len - offset)
+            # Send only as much as the peer can handle
+            payload_len = min(MSS, total_len - offset, self.peer_window)
+
             seq_no = self.window["next_seq_to_send"]
             chunk = data[offset : offset + payload_len]
 
             # Create a packet
-            segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-            ack_goal = seq_no + payload_len
+            segment = Packet(
+                seq=seq_no,
+                ack=self.window["last_ack"],
+                flags=0,
+                payload=chunk
+            )
 
-            # Record the send time for RTT estimation
+            ack_goal = seq_no + payload_len
             self.packet_send_times[ack_goal] = time.time()
 
-            while True:
-                print(f"Sending segment (seq={seq_no}, len={payload_len})")
-                self.sock_fd.sendto(segment.encode(), self.conn)
+            # Send it
+            print(f"Sending segment (seq={seq_no}, len={payload_len}), peer_window={self.peer_window}")
+            self.sock_fd.sendto(segment.encode(), self.conn)
 
-                # Wait for an ACK. If a timeout occurs and state is still ESTABLISHED, retransmit.
-                if self.wait_for_ack(ack_goal):
-                    print(f"Segment {seq_no} acknowledged.")
-                    self.window["next_seq_to_send"] += payload_len
-                    break
-                else:
-                    print("Timeout: Retransmitting segment.")
-
-            offset += payload_len
-
+            # Wait for ACK or timeout
+            if self.wait_for_ack(ack_goal):
+                self.window["next_seq_to_send"] += payload_len
+                offset += payload_len
+            else:
+                print("Timeout or window update needed. Retransmit?")
 
 
     def wait_for_ack(self, ack_goal):
@@ -380,7 +384,7 @@ class TransportSocket:
                 # Remove it from the dict so we don't reuse it
                 del self.packet_send_times[ack_goal]
 
-                # Update moothed_rtt with EWMA:
+                # Update smoothed_rtt with EWMA:
                 # smoothed_rtt = alpha * smoothed_rtt + (1 - alpha) * sample_rtt
                 self.smoothed_rtt = self.alpha * self.smoothed_rtt + (1.0 - self.alpha) * sample_rtt
 
@@ -411,7 +415,7 @@ class TransportSocket:
                     if not self.close_timer:
                         self.close_timer = time.time()
 
-                    if time.time() - self.close_timer > 0.05:
+                    if time.time() - self.close_timer > self.smoothed_rtt:
                         self.state = State.CLOSED
                         print(f"{self.state} Now closing...")
                         # self.close()
