@@ -1,7 +1,6 @@
 import os
 import random
 import string
-import time
 from transport import TransportSocket, ReadMode
 
 def generate_random_data(size):
@@ -36,7 +35,6 @@ def server_main():
     print(f"Server: Sending randomly generated data to the client...")
     server_socket.send(random_data)
 
-    time.sleep(10)
     # Close the server socket
     server_socket.close()
 

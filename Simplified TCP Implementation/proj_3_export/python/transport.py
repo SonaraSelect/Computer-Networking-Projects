@@ -139,9 +139,18 @@ class TransportSocket:
         """
         Close the socket and stop the backend thread.
         """
-        print("CLOSED")
+        print(f" {self.state} CLOSED has been run")
         # self.state = State.CLOSED # <------------------------------------
-        self.send_fin_packet()
+        # if not self.state == State.CLOSED:
+        #     self.send_fin_packet()
+
+        if self.state == State.ESTABLISHED or self.state == State.SYN_RCVD:
+            print(f"==> {self.state} ran close() transitioning to FIN_SENT")
+            # self.state = State.FIN_SET
+            self.send_fin_packet()
+        else:
+            print(f"==> {self.state} ran close() transitioning to LAST_ACK")
+            self.state = State.LAST_ACK
 
         # Wait until CLOSED or timeout
         with self.wait_cond:
@@ -243,12 +252,12 @@ class TransportSocket:
         )
 
         self.state = State.FIN_SENT
-
-        while self.state != State.TIME_WAIT:
+        
+        while self.state != State.TIME_WAIT: # or self.state != State.CLOSE_WAIT:
             self.sock_fd.sendto(fin.encode(), self.conn)
             with self.wait_cond:
                 self.wait_cond.wait_for(lambda: self.state == State.TIME_WAIT, timeout=DEFAULT_TIMEOUT)
-        print(f"==> ESTABLISHED Sending FIN segment {seq_no}, size {len(payload)} transitioning to FIN_SENT")            
+        print(f"==> {self.state} Sending FIN segment {seq_no}, size {len(payload)} transitioning to FIN_SENT")            
             
 
 
@@ -374,6 +383,7 @@ class TransportSocket:
                     if time.time() - self.close_timer > 0.05:
                         self.state = State.CLOSED
                         print(f"{self.state} Now closing...")
+                        # self.close()
 
 
                 data, addr = self.sock_fd.recvfrom(2048)
@@ -489,7 +499,7 @@ class TransportSocket:
                         # If we get an ACK packet, transition to TIME_WAIT
                         if packet.flags & ACK_FLAG:
                             with self.recv_lock:
-                                print("==> {self.State} FIN_SENT Received ACK, transitioning to TIME_WAIT")
+                                print(f"==> {self.state} FIN_SENT Received ACK, transitioning to TIME_WAIT")
 
                                 self.state = State.TIME_WAIT
                                 self.wait_cond.notify_all()
@@ -497,7 +507,7 @@ class TransportSocket:
                         # If we get a FIN packet, send ack and transition to TIME_WAIT
                         if packet.flags & FIN_FLAG != 0:
                             with self.recv_lock:
-                                print("==> {self.State} FIN_SENT Received FIN_FLAG, send ACK then transitioning to TIME_WAIT")
+                                print(f"==> {self.state} FIN_SENT Received FIN_FLAG, send ACK then transitioning to TIME_WAIT")
                                 self.send_ack(packet, ACK_FLAG, addr)
 
                                 self.state = State.TIME_WAIT
@@ -571,7 +581,7 @@ class TransportSocket:
 
                     case(State.CLOSED):
                         print("==> CLOSED Connection has closed.")
-                        continue
+                        continue #todo maybe make this break
 
                     
 
