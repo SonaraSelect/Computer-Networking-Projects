@@ -96,38 +96,28 @@ class TransportSocket:
 
     def add_to_buffer(self, packet):
         """
-        Add a packet to the data_buffer, ensuring the buffer remains sorted by packet sequence number.
-        If a packet with the same sequence number already exists, it is ignored.
+        Add a packet to the end of the data_buffer. Will automatically sort and ignore repeats
         """
-        # If the buffer is empty, simply append.
-        if not self.data_buffer:
-            self.data_buffer.append(packet)
-            return
+        match(len(self.data_buffer)):
+            case 0:
+                self.data_buffer.append(packet)
 
-        # Check for duplicates.
-        for p in self.data_buffer:
-            if p.seq == packet.seq:
-                # Duplicate packet; ignore it.
-                return
-
-        # If the new packet's sequence number is less than the first element, insert at beginning.
-        if packet.seq < self.data_buffer[0].seq:
-            self.data_buffer.insert(0, packet)
-            return
-
-        # Otherwise, find the proper insertion index.
-        inserted = False
-        for i in range(len(self.data_buffer) - 1):
-            # If packet.seq fits between data_buffer[i] and data_buffer[i+1]
-            if self.data_buffer[i].seq < packet.seq < self.data_buffer[i+1].seq:
-                self.data_buffer.insert(i + 1, packet)
-                inserted = True
-                break
-
-        # If not inserted, then packet.seq is greater than all in the buffer; append it.
-        if not inserted:
-            self.data_buffer.append(packet)
-
+            case 1:
+                if packet.seq < self.data_buffer[0].seq:
+                    self.data_buffer.insert(0,packet)
+                else:
+                    self.data_buffer.append(packet)
+                
+            case _:
+                for i, buffered_packet in enumerate(self.data_buffer):
+                    if i+1 < len(self.data_buffer):
+                        # If packet seq fits between this buffered packet and the next one
+                        if buffered_packet.seq < packet.seq and packet.seq < self.data_buffer[i+1].seq:
+                            self.data_buffer.insert(i+1, packet)
+                            return
+                # If packet seq number greater than all buffered packets
+                if(self.data_buffer[len(self.data_buffer) - 1].seq < packet.seq):
+                    self.data_buffer.append(packet)
 
 
     def socket(self, sock_type, port, server_ip=None):
@@ -300,179 +290,139 @@ class TransportSocket:
             self.recv_lock.release()
 
         return read_len
-    
-
-    def send_segment(self, data):
-        """
-        Sends 'data' by breaking it into MSS-sized segments, and sends them using a sliding window protocol.
-        """
-        total_len = len(data)
-        segments = []  # List to hold all segments (Packet objects)
-        offset = 0
-        seq = self.window["next_seq_to_send"]
-
-        # 1. Segment the data into MSS-sized packets.
-        while offset < total_len:
-            payload_len = min(MSS, total_len - offset)
-            chunk = data[offset: offset + payload_len]
-            # Create a packet; note: the ack value will be set by the sender as needed.
-            packet = Packet(seq=seq, ack=self.window["last_ack"], flags=0, payload=chunk)
-            segments.append(packet)
-            seq += payload_len  # Advance the sequence number by the payload length
-            offset += payload_len
-
-        # Update next sequence to send (for future transmissions)
-        self.window["next_seq_to_send"] = seq
-
-        # Sliding window parameters:
-        sws = self.window["sws"]  # e.g., 3 segments at a time
-        base = 0                 # Index of the first unacknowledged segment
-        next_seg = 0             # Index of the next segment to send
-
-        # 2. Enter the send loop.
-        while base < len(segments):
-            # Send segments until the window is full or we've sent all segments.
-            while next_seg < len(segments) and (next_seg - base) < sws:
-                seg = segments[next_seg]
-                ack_goal = seg.seq + len(seg.payload)
-                # Record the send time for RTT calculations.
-                self.packet_send_times[ack_goal] = time.time()
-                print(f"Sending segment: seq={seg.seq}, len={len(seg.payload)}")
-                self.sock_fd.sendto(seg.encode(), self.conn)
-                next_seg += 1
-
-            # 3. Wait for the cumulative ACK for the base segment.
-            # The expected ACK value is the base segment's sequence number plus its payload length.
-            ack_goal = segments[base].seq + len(segments[base].payload)
-            if self.wait_for_ack(ack_goal):
-                print(f"Segment with seq {segments[base].seq} acknowledged.")
-                base += 1  # Slide the window forward (cumulative ACK)
-            else:
-                # Timeout occurred; retransmit all segments in the window.
-                print("Timeout: Retransmitting segments in the current window.")
-                for i in range(base, next_seg):
-                    seg = segments[i]
-                    ack_goal = seg.seq + len(seg.payload)
-                    self.packet_send_times[ack_goal] = time.time()  # Reset timer
-                    print(f"Retransmitting segment: seq={seg.seq}, len={len(seg.payload)}")
-                    self.sock_fd.sendto(seg.encode(), self.conn)
-
 
     # def calibrate_segment_pointers(seg1, seg2, seg3):
     #     if seg1 + MSS < total_len:
             
 
-    # def send_segment(self, data):
-    #     """
-    #     Send 'data' in multiple MSS-sized segments and reliably wait for each ACK
-    #     """
+    def send_segment(self, data):
+        """
+        Send 'data' in multiple MSS-sized segments and reliably wait for each ACK
+        """
 
-    #     # implement pipelining, sending 3 segments at a time
-    #     offset = 0
-    #     total_len = len(data)
-    #     next_seq = self.window["next_seq_to_send"]
+        # implement pipelining, sending 3 segments at a time
+        offset = 0
+        total_len = len(data)
+        next_seq = self.window["next_seq_to_send"]
 
-    #     SWS = 3
-    #     LAR = -1
-    #     LFS = -1
-    #     timestamp = None
+        SWS = 3
+        LAR = -1
+        LFS = -1
+        timestamp = None
 
-    #     # Create a list of frames ready to send
-    #     while offset < total_len:
-    #         payload_len = min(MSS, total_len - offset)
-    #         seq_no = next_seq
-    #         chunk = data[offset : offset + payload_len]
+        # Create a list of frames ready to send
+        while offset < total_len:
+            payload_len = min(MSS, total_len - offset)
+            seq_no = next_seq
+            chunk = data[offset : offset + payload_len]
 
-    #         # todo update ACK value later of course
-    #         frame = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-    #         self.window["send_buf"].append(frame)
-    #         next_seq += payload_len # + 1
-    #         offset += payload_len
+            # todo update ACK value later of course
+            frame = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
+            self.window["send_buf"].append(frame)
+            next_seq += payload_len # + 1
+            offset += payload_len
 
-    #     # Slowly go through send buffer
-    #     while len(self.window["send_buf"]) > 0:
-    #         # If not all frames in window have been sent
-    #         if LFS - LAR <= SWS:
-    #             segment = self.window["send_buf"][LAR+1]
-    #             segment.ack = self.window["last_ack"]
-    #             self.window["next_seq_to_send"] += segment.payload
+        # Slowly go through send buffer
+        while len(self.window["send_buf"]) > 0:
+            # If not all frames in window have been sent
+            if LFS - LAR <= SWS:
+                segment = self.window["send_buf"][LAR+1]
+                segment.ack = self.window["last_ack"]
+                self.window["next_seq_to_send"] += segment.payload
 
-    #             self.sock_fd.sendto(segment.encode(), self.conn)
+                self.sock_fd.sendto(segment.encode(), self.conn)
 
-    #             if timestamp is None:
-    #                 timestamp = time.time()
-
-    #     while offset < total_len:
-    #         payload_len = min(MSS, total_len - offset)
-            
-
-    #     # Junkie!
-    #     while offset < total_len:
-    #         payload_len = min(MSS, total_len - offset)
-
-    #         # Current sequence number
-    #         seq_no = self.window["next_seq_to_send"]
-    #         chunk = data[offset : offset + payload_len]
-
-    #         # Create a packet
-    #         segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-
-    #         # We expect an ACK for seq_no + payload_len
-    #         ack_goal = seq_no + payload_len
-
-    #     ack_window = {False, False, False}
-
-    #     # Calibrate segment pointer values
-    #     if MSS < total_len:
-    #         window[2] = total_len
-    #     else:
-    #         window[2] = MSS
-    #         if MSS * 2 < total_len:
-    #             window[3] = total_len
-    #         else:
-    #             window[3] = MSS * 2
+                if timestamp is None:
+                    timestamp = time.time()
                 
-    #     if self.state == State.ESTABLISHED:
             
 
-    #         for segment in window:
-    #             segment = segment + 3*MSS if segment + 3*MSS < total_len else 0
+
+        while offset < total_len:
+            payload_len = min(MSS, total_len - offset)
+            
+
+        # Junkie!
+        while offset < total_len:
+            payload_len = min(MSS, total_len - offset)
+
+            # Current sequence number
+            seq_no = self.window["next_seq_to_send"]
+            chunk = data[offset : offset + payload_len]
+
+            # Create a packet
+            segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
+
+            # We expect an ACK for seq_no + payload_len
+            ack_goal = seq_no + payload_len
+
+        ack_window = {False, False, False}
+
+        # Calibrate segment pointer values
+        if MSS < total_len:
+            window[2] = total_len
+        else:
+            window[2] = MSS
+            if MSS * 2 < total_len:
+                window[3] = total_len
+            else:
+                window[3] = MSS * 2
+                
+        if self.state == State.ESTABLISHED:
+            
+            
+            
+            
+            
+            for segment in window:
+                segment = segment + 3*MSS if segment + 3*MSS < total_len else 0
                     
-    #     if self.state == State.ESTABLISHED:
 
-    #         # While there's data left to send
-    #         while offset < total_len:
-    #             payload_len = min(MSS, total_len - offset)
 
-    #             # Current sequence number
-    #             seq_no = self.window["next_seq_to_send"]
-    #             chunk = data[offset : offset + payload_len]
 
-    #             # Create a packet
-    #             segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
 
-    #             # We expect an ACK for seq_no + payload_len
-    #             ack_goal = seq_no + payload_len
+            
 
-    #             # Record time packet is sent
-    #             self.packet_send_times[ack_goal] = time.time()
 
-    #             while True:
-    #                 print(f"Sending segment (seq={seq_no}, len={payload_len})")
-    #                 self.sock_fd.sendto(segment.encode(), self.conn)
 
-    #                 if self.wait_for_ack(ack_goal):
-    #                     print(f"Segment {seq_no} acknowledged.")
-    #                     # Advance our next_seq_to_send
-    #                     self.window["next_seq_to_send"] += payload_len
 
-    #                     # todo erase data from buffer
 
-    #                     break
-    #                 else:
-    #                     print("Timeout: Retransmitting segment.")
+        
+        if self.state == State.ESTABLISHED:
 
-    #             offset += payload_len
+            # While there's data left to send
+            while offset < total_len:
+                payload_len = min(MSS, total_len - offset)
+
+                # Current sequence number
+                seq_no = self.window["next_seq_to_send"]
+                chunk = data[offset : offset + payload_len]
+
+                # Create a packet
+                segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
+
+                # We expect an ACK for seq_no + payload_len
+                ack_goal = seq_no + payload_len
+
+                # Record time packet is sent
+                self.packet_send_times[ack_goal] = time.time()
+
+                while True:
+                    print(f"Sending segment (seq={seq_no}, len={payload_len})")
+                    self.sock_fd.sendto(segment.encode(), self.conn)
+
+                    if self.wait_for_ack(ack_goal):
+                        print(f"Segment {seq_no} acknowledged.")
+                        # Advance our next_seq_to_send
+                        self.window["next_seq_to_send"] += payload_len
+
+                        # todo erase data from buffer
+
+                        break
+                    else:
+                        print("Timeout: Retransmitting segment.")
+
+                offset += payload_len
 
 
     def wait_for_ack(self, ack_goal):
@@ -487,6 +437,7 @@ class TransportSocket:
                 remaining = DEFAULT_TIMEOUT - elapsed
                 if remaining <= 0:
                     return False
+# 
                 self.wait_cond.wait(timeout=remaining)
 
             # ACK has been received, now calculate RTT
@@ -511,27 +462,6 @@ class TransportSocket:
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
         self.window["last_ack"] = ack_val
-
-    def deliver_buffered_packets(self):
-        """
-        Checks the buffered out-of-order segments and delivers any that now
-        fit into the in-order sequence.
-        """
-        delivered = True
-        while delivered:
-            delivered = False
-            # Look for a packet with the exact sequence number we expect next
-            expected_seq = self.window["last_ack"]
-            for packet in self.data_buffer:
-                if packet.seq == expected_seq:
-                    print(f"Delivering buffered packet: seq={packet.seq}")
-                    self.window["recv_buf"] += packet.payload
-                    self.window["recv_len"] += len(packet.payload)
-                    self.window["last_ack"] += len(packet.payload)
-                    self.data_buffer.remove(packet)
-                    delivered = True
-                    break
-
 
     def backend(self):
         """
@@ -640,66 +570,54 @@ class TransportSocket:
 
                         # Otherwise, assume it is a data packet
                         # Check if the sequence matches our 'last_ack' (in-order data)
-                        with self.recv_lock:
-                            # Check if the packet is the one we expect
-                            expected_seq = self.window["last_ack"]  # or a dedicated variable, e.g., NFE
-                            if packet.seq == expected_seq:
-                                # Deliver packet payload immediately
+                        if packet.seq == self.window["last_ack"]:
+                            with self.recv_lock:
+                                # Append payload to our receive buffer
                                 self.window["recv_buf"] += packet.payload
                                 self.window["recv_len"] += len(packet.payload)
-                                print(f"Received in-order segment: seq={packet.seq}, len={len(packet.payload)}")
-                                # Advance expected sequence number (cumulative ACK)
-                                self.window["last_ack"] += len(packet.payload)
-                                
-                                # Check buffered packets for any that can now be delivered in order
-                                self.deliver_buffered_packets()
-                                
-                                # Send a cumulative ACK for the new last_ack value
-                                self.send_ack(packet, ACK_FLAG, addr)
-                                
-                            elif packet.seq > expected_seq:
-                                # Out-of-order segment: buffer it if not already buffered
-                                if not any(p.seq == packet.seq for p in self.data_buffer):
-                                    print(f"Buffering out-of-order segment: seq={packet.seq}")
-                                    self.add_to_buffer(packet)
-                                # Send a duplicate ACK indicating expected_seq (last_ack)
-                                self.send_ack(packet, ACK_FLAG, addr)
-                                
-                            else:
-                                # Duplicate or old packet: simply resend ACK
-                                print(f"Duplicate/old segment: seq={packet.seq}, expected={expected_seq}")
-                                self.send_ack(packet, ACK_FLAG, addr)
 
-                            self.wait_cond.notify_all()
-                            continue
+                            with self.wait_cond:
+                                self.wait_cond.notify_all()
 
-                            # print(f"====> recv_len={self.window["recv_len"]}")
-                            # print(f"====> recv_buf={self.window["recv_buf"]}")
+                            print(f"Received segment {packet.seq} with {len(packet.payload)} bytes.")
+
+                            # Send back an acknowledgment & Update last ACK
+                            self.send_ack(packet, ACK_FLAG, addr)
+
+                        else:
+                            # todo For a real TCP, we need to send duplicate ACK or ignore out-of-order data
+                            print(f"Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
+
+                            # check if in buffer
+                            # if not in buffer, add to buffer
+                            
+                            # if correct order, still add to buffer
+                            # buffer ordered by seq num
 
                     case(State.FIN_SENT):
-                        # if packet.flags & 0 != 0:
-                        #     with self.recv_lock:
-                        #         print("==> FIN_SENT Received segment, transitioning to ESTABLISHED")
-                        #         # Still handle the data (vv copied from established vv)
-                        #         # -------------------------------------------------
-                        #         # Check if the sequence matches our 'last_ack' (in-order data)
-                        #         if packet.seq == self.window["last_ack"]:
-                        #             with self.recv_lock:
-                        #                 # Append payload to our receive buffer
-                        #                 self.window["recv_buf"] += packet.payload
-                        #                 self.window["recv_len"] += len(packet.payload)
+                        if packet.flags & 0 != 0:
+                            with self.recv_lock:
+                                print("==> FIN_SENT Received segment, transitioning to ESTABLISHED")
+                                # Still handle the data (vv copied from established vv)
+                                # -------------------------------------------------
+                                # Check if the sequence matches our 'last_ack' (in-order data)
+                                if packet.seq == self.window["last_ack"]:
+                                    with self.recv_lock:
+                                        # Append payload to our receive buffer
+                                        self.window["recv_buf"] += packet.payload
+                                        self.window["recv_len"] += len(packet.payload)
 
-                        #             with self.wait_cond:
-                        #                 self.wait_cond.notify_all()
+                                    with self.wait_cond:
+                                        self.wait_cond.notify_all()
 
-                        #             print(f"Received segment {packet.seq} with {len(packet.payload)} bytes.")
+                                    print(f"Received segment {packet.seq} with {len(packet.payload)} bytes.")
 
-                        #             # Send back an acknowledgment & Update last ACK
-                        #             self.send_ack(packet, ACK_FLAG, addr)
-                        #         # -------------------------------------------------
-                        #         self.state = State.ESTABLISHED
-                        #         self.wait_cond.notify_all()
-                        #         continue
+                                    # Send back an acknowledgment & Update last ACK
+                                    self.send_ack(packet, ACK_FLAG, addr)
+                                # -------------------------------------------------
+                                self.state = State.ESTABLISHED
+                                self.wait_cond.notify_all
+                                continue
 
                         # If we get an ACK packet, transition to TIME_WAIT
                         if packet.flags & ACK_FLAG:
@@ -774,7 +692,7 @@ class TransportSocket:
                                 continue
 
                     case(State.LAST_ACK):
-                        if packet.flags & ACK_FLAG !=0:
+                        if packet.flags * ACK_FLAG !=0:
                             with self.recv_lock:
                                 print("==> LACT_ACK Received ACK. transitioning to CLOSED")
                                 
