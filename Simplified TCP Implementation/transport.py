@@ -71,6 +71,12 @@ class TransportSocket:
             "recv_buf": b"",          # Received data buffer
             "recv_len": 0,            # How many bytes are in recv_buf
             "next_seq_to_send": 0,    # The sequence number for the next packet we send
+            # my additions -----
+            "send_buf": [],            # Send data buffer
+            "sendQ" : [],
+            "sws": 3,
+            "LAR": None,
+            "LFS": None
         }
         self.sock_type = None
         self.conn = None
@@ -79,6 +85,7 @@ class TransportSocket:
         # my additions -----------
         self.state = State.LISTEN
         self.close_timer = None
+        self.output_buffer = []
         self.data_buffer = []
 
         self.est_rtt = DEFAULT_TIMEOUT           # Initial Estimated RTT
@@ -152,6 +159,9 @@ class TransportSocket:
         if self.state == State.ESTABLISHED or self.state == State.SYN_RCVD:
             print(f"==> {self.state} ran close() transitioning to FIN_SENT")
             # self.state = State.FIN_SET
+
+            # todo check for data in send buffer
+
             self.send_fin_packet()
         else:
             print(f"==> {self.state} ran close() transitioning to LAST_ACK")
@@ -196,34 +206,6 @@ class TransportSocket:
 
             # Finished sending. Send FIN
             # self.send_fin_packet()
-
-    # def send_syn_packet(self):
-    #     seq_no = self.window["next_seq_to_send"]
-    #     ack_no = self.window["last_ack"]
-    #     payload = b''
-
-    #     syn = Packet(
-    #         seq= seq_no,
-    #         ack=self.window["last_ack"],
-    #         flags=SYN_FLAG,
-    #         payload=payload
-    #         )
-        
-    #     self.state = State.SYN_SENT
-
-    #     print(f"BEFORE next seq {self.window["next_seq_to_send"]}")
-
-    
-    #     while True:
-            
-
-    #         print(f"==> LISTEN Sending SYN segment {seq_no}, size {len(payload)} transitioning to SYN_SENT")
-    #         self.sock_fd.sendto(syn.encode(), self.conn)
-    #         if(self.wait_for_ack(seq_no + len(payload))):
-    #             print(f"SYN+ACK segment {seq_no} acknowledged")
-    #             self.window["next_seq_to_send"] += len(payload)
-    #             print(f"AFTER next seq {self.window["next_seq_to_send"]}")
-    #             break
 
     def send_syn_packet(self):
         seq_no = self.window["next_seq_to_send"]
@@ -309,12 +291,101 @@ class TransportSocket:
 
         return read_len
 
+    # def calibrate_segment_pointers(seg1, seg2, seg3):
+    #     if seg1 + MSS < total_len:
+            
+
     def send_segment(self, data):
         """
         Send 'data' in multiple MSS-sized segments and reliably wait for each ACK
         """
+
+        # implement pipelining, sending 3 segments at a time
         offset = 0
         total_len = len(data)
+        next_seq = self.window["next_seq_to_send"]
+
+        SWS = 3
+        LAR = -1
+        LFS = -1
+        timestamp = None
+
+        # Create a list of frames ready to send
+        while offset < total_len:
+            payload_len = min(MSS, total_len - offset)
+            seq_no = next_seq
+            chunk = data[offset : offset + payload_len]
+
+            # todo update ACK value later of course
+            frame = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
+            self.window["send_buf"].append(frame)
+            next_seq += payload_len # + 1
+            offset += payload_len
+
+        # Slowly go through send buffer
+        while len(self.window["send_buf"]) > 0:
+            # If not all frames in window have been sent
+            if LFS - LAR < SWS:
+                segment = self.window["send_buf"][LAR+1]
+                segment.ack = self.window["last_ack"]
+                self.window["next_seq_to_send"] += segment.payload
+
+                self.sock_fd.sendto(segment.encode(), self.conn)
+
+                if timestamp is None:
+                    timestamp = time.time()
+                
+            
+
+
+        while offset < total_len:
+            payload_len = min(MSS, total_len - offset)
+            
+
+        # Junkie!
+        while offset < total_len:
+            payload_len = min(MSS, total_len - offset)
+
+            # Current sequence number
+            seq_no = self.window["next_seq_to_send"]
+            chunk = data[offset : offset + payload_len]
+
+            # Create a packet
+            segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
+
+            # We expect an ACK for seq_no + payload_len
+            ack_goal = seq_no + payload_len
+
+        ack_window = {False, False, False}
+
+        # Calibrate segment pointer values
+        if MSS < total_len:
+            window[2] = total_len
+        else:
+            window[2] = MSS
+            if MSS * 2 < total_len:
+                window[3] = total_len
+            else:
+                window[3] = MSS * 2
+                
+        if self.state == State.ESTABLISHED:
+            
+            
+            
+            
+            
+            for segment in window:
+                segment = segment + 3*MSS if segment + 3*MSS < total_len else 0
+                    
+
+
+
+
+            
+
+
+
+
 
         
         if self.state == State.ESTABLISHED:
@@ -344,6 +415,9 @@ class TransportSocket:
                         print(f"Segment {seq_no} acknowledged.")
                         # Advance our next_seq_to_send
                         self.window["next_seq_to_send"] += payload_len
+
+                        # todo erase data from buffer
+
                         break
                     else:
                         print("Timeout: Retransmitting segment.")
@@ -402,7 +476,7 @@ class TransportSocket:
                     if not self.close_timer:
                         self.close_timer = time.time()
 
-                    if time.time() - self.close_timer > 2 * self.est_rtt:
+                    if time.time() - self.close_timer > 2 * self.est_rtt:   # todo 2*segment timeout
                         self.state = State.CLOSED
                         print(f"{self.state} Now closing...")
                         # self.close()
@@ -475,6 +549,9 @@ class TransportSocket:
                         # If it's a FIN packet, transition to CLOSE_WAIT
                         if packet.flags & FIN_FLAG != 0:
                             with self.recv_lock:
+                                # todo only if no data is left
+
+
                                 print("==> ESTABLISHED received FIN transitioning to CLOSE_WAIT")
                                 self.send_ack(packet, ACK_FLAG, addr)
                                 
@@ -518,6 +595,30 @@ class TransportSocket:
                             # buffer ordered by seq num
 
                     case(State.FIN_SENT):
+                        if packet.flags & 0 != 0:
+                            with self.recv_lock:
+                                print("==> FIN_SENT Received segment, transitioning to ESTABLISHED")
+                                # Still handle the data (vv copied from established vv)
+                                # -------------------------------------------------
+                                # Check if the sequence matches our 'last_ack' (in-order data)
+                                if packet.seq == self.window["last_ack"]:
+                                    with self.recv_lock:
+                                        # Append payload to our receive buffer
+                                        self.window["recv_buf"] += packet.payload
+                                        self.window["recv_len"] += len(packet.payload)
+
+                                    with self.wait_cond:
+                                        self.wait_cond.notify_all()
+
+                                    print(f"Received segment {packet.seq} with {len(packet.payload)} bytes.")
+
+                                    # Send back an acknowledgment & Update last ACK
+                                    self.send_ack(packet, ACK_FLAG, addr)
+                                # -------------------------------------------------
+                                self.state = State.ESTABLISHED
+                                self.wait_cond.notify_all
+                                continue
+
                         # If we get an ACK packet, transition to TIME_WAIT
                         if packet.flags & ACK_FLAG:
                             with self.recv_lock:
