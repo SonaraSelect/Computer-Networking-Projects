@@ -416,7 +416,7 @@ class TransportSocket:
                 # Timeout occurred; retransmit all segments in the window.
 
                 # todo TK timeout event
-                self.tcp_handle_timeout
+                self.tcp_handle_timeout()
 
                 print("Timeout: Retransmitting segments in the current window.")
                 for i in range(base, LFS):
@@ -530,7 +530,8 @@ class TransportSocket:
                                 with self.wait_cond:
                                     self.wait_cond.wait(timeout=DEFAULT_TIMEOUT)
 
-                            self.wait_cond.notify_all()
+                            with self.wait_cond:
+                                self.wait_cond.notify_all()
                             continue
                                 
 
@@ -569,7 +570,8 @@ class TransportSocket:
                                     self.wait_cond.wait(timeout=DEFAULT_TIMEOUT)
 
                                 
-                            self.wait_cond.notify_all()
+                            with self.wait_cond:
+                                self.wait_cond.notify_all()
                             continue
 
 
@@ -614,7 +616,7 @@ class TransportSocket:
                                     print(f"New ACK window={packet.window * MSS}")
                                 else:
                                     # todo TK fsm handle duplicate ACK
-                                    self.tcp_handle_dup_ack
+                                    self.tcp_handle_dup_ack()
                                 self.wait_cond.notify_all()
                             continue
 
