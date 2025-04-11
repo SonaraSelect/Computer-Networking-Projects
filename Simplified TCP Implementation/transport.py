@@ -96,6 +96,8 @@ class TransportSocket:
         self.close_timer = None
         self.output_buffer = []
         self.data_buffer = []
+        self.ack_timer = -1                      # Timer used to retransmit special ACKs. Will be -1 when not in use
+        self.last_ack_packet = None              # Special ACK packet to be retransmitted
 
         self.est_rtt = DEFAULT_TIMEOUT           # Initial Estimated RTT
         self.alpha = 0.5                         # Alpha value between 0 and 1
@@ -369,8 +371,6 @@ class TransportSocket:
         offset = 0
         seq = self.window["next_seq_to_send"]
 
-        # todo QUESTIONS: should we go back to slow start every time send_segment is run?
-
         # Initialize TCP state control variables
         self.tcp_state = TCP_State.SLOW_START
         self.cwnd = WINDOW_INITIAL_WINDOW_SIZE / MSS
@@ -447,11 +447,11 @@ class TransportSocket:
                 # Remove it from the dict so we don't reuse it
                 del self.packet_send_times[ack_goal]
 
-                # Update moothed_rtt with EWMA:
+                # Update est_rtt with EWMA:
                 # est_rtt = alpha * est_rtt + (1 - alpha) * sample_rtt
                 self.est_rtt = self.alpha * self.est_rtt + (1.0 - self.alpha) * sample_rtt
 
-                # Optionally set your timeout as some multiple of est_rtt (e.g., 2 * est_rtt)
+                # Optionally set timeout as some multiple of est_rtt
                 self.timeout = 2 * self.est_rtt
                 print(f"Updated RTT: sample={sample_rtt:.4f}, est_rtt={self.est_rtt:.4f}, timeout={self.timeout:.4f}")
             return True
@@ -463,6 +463,7 @@ class TransportSocket:
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
         self.window["last_ack"] = ack_val
+        return ack_packet
 
     def deliver_buffered_packets(self):
         """
@@ -518,28 +519,27 @@ class TransportSocket:
                             with self.recv_lock:
                                 print("==> Received SYN, transitioning to SYN_RCVD")
                                 
-                                # self.window["next_seq_to_send"] += packet.ack
-                                # self.window["last_ack"] = packet.seq
-
-                                # response = Packet(
-                                #     self.window["next_seq_to_send"],
-                                #     self.window["last_ack"]
-                                # )
-                                
-                                self.send_ack(packet, SYN_FLAG+ACK_FLAG, addr)
+                                self.last_ack_packet = self.send_ack(packet, SYN_FLAG+ACK_FLAG, addr)
+                                self.ack_timer = time.time()
 
                                 self.state = State.SYN_RCVD
                                 self.wait_cond.notify_all()
                                 continue
                                 
-                    
+
                     case(State.SYN_SENT):
+
+                        if time.time() - self.ack_timer > self.timeout:
+                            self.sock_fd.sendto(self.last_ack_packet.encode(), addr)
+                            self.ack_timer = time.time()
+
                         # If we get a SYN+ACK
                         if packet.flags & (SYN_FLAG + ACK_FLAG) != 0:
                             with self.recv_lock:
                                 # Send back an ack
                                 print("==> SYN_SENT Received SYN+ACK transitioning to ESTABLISHED")
-                                self.send_ack(packet, ACK_FLAG, addr)
+                                self.last_ack_packet = self.send_ack(packet, ACK_FLAG, addr)
+                                self.ack_timer = time.time()
                                 
                                 self.state = State.ESTABLISHED
                                 self.wait_cond.notify_all()
@@ -550,7 +550,8 @@ class TransportSocket:
                             with self.recv_lock:
                                 # send syn ack
                                 print("==> SYN Received SYN, sending SYN+ACK. Trans. to SYN_RCVD")
-                                self.send_ack(packet, SYN_FLAG+ACK_FLAG, addr)
+                                self.last_ack_packet = self.send_ack(packet, SYN_FLAG+ACK_FLAG, addr)
+                                self.ack_timer = time.time()
 
                                 self.state = State.SYN_RCVD
                                 self.wait_cond.notify_all()
@@ -558,6 +559,11 @@ class TransportSocket:
 
 
                     case(State.SYN_RCVD):
+
+                        if time.time() - self.ack_timer > self.timeout:
+                            self.sock_fd.sendto(self.last_ack_packet.encode(), addr)
+                            self.ack_timer = time.time()
+
                         if packet.flags & ACK_FLAG != 0:
                             with self.recv_lock:
                                 print("==> SYN_RCVD Received ACK, trans. to ESTABLISHED")
