@@ -1,6 +1,32 @@
 # Welcome to my Simplified TCP Implementation!
 *by Audrey Michel*
 
+# CHECKPOINT 2
+
+First I must mention one specific bug: right now the handshake ACKs, SYNs, and SYN+ACKs are not always retransmitted, so there is a small chance of a packet loss occuring at the beginning, leaving the server or clients stuck in the handshake states.
+
+Otherwise, everything else is fully implemented. The tcp congestion control states and dynamic change of the send window size are implemented, and every time a value is changed it will be printed out to console.
+
+## congestion window
+
+One eccentricity in my design is that the sending sliding window works by first dividing the text into packets and buffering them in a to-send list called frames. This means that when a frame is to be sent, the packet is simply read from the frames list and sent. The buffering of packets also works in the same way.
+
+This presents one issue, where the window sizes and congestion window are now in unit of frames, rather than bytes. My solution to this was to multiply all values by MSS to convert them back to bytes for ease of debugging.
+
+## congestion control fsm
+
+Everything else is implemented as expected.
+
+## PYTHON 3 IS NEEDED TO RUN MY CODE !!
+Run on Ubuntu 24.04.1 LTS on WSL2
+Kernel: 5.15.167.4-microsoft-standard-WSL2
+(alternate kernel needed to simulate network congestion)
+
+
+
+
+# LEGACY README FROM CHECKPOINT 1
+
 Now, for checkpoint one I was only able to implement the FSM and estimated RTT. There are still some remaining bugs. For example, sometimes the server side will remain stuck in a loop and never close. I have been unable to reliably recreate this bug, as it randomly goes away as fast as it came, even without having made any changes.
 
 **One important note is that the server side will take a moment before it can fully close.** While the client closes nearly instantly, the server will take much longer. This kink is still being worked out.
@@ -32,8 +58,3 @@ Default values include:
 - self.est_rtt = DEFAULT_TIMEOUT
 - self.alpha = 0.5
 - self.RTT = DEFAULT_TIMEOUT
-
-## PYTHON 3 IS NEEDED TO RUN MY CODE !!
-Run on Ubuntu 24.04.1 LTS on WSL2
-Kernel: 5.15.167.4-microsoft-standard-WSL2
-(alternate kernel needed to simulate network congestion)
