@@ -546,7 +546,7 @@ class TransportSocket:
                             with self.recv_lock:
                                 # Send back an ack
                                 print("==> SYN_SENT Received SYN+ACK transitioning to ESTABLISHED")
-                                self.last_ack_packet = self.send_ack(packet, ACK_FLAG, addr) #todo how to resend this ACK?
+                                self.ack_packet = self.send_ack(packet, ACK_FLAG, addr) #todo how to resend this ACK?
                                 self.ack_timer = time.time()
                                 
                                 self.state = State.ESTABLISHED
