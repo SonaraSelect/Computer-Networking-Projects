@@ -3,7 +3,7 @@ import struct
 import threading
 import time  
 from enum import Enum, auto
-from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER, WINDOW_INITIAL_WINDOW_SIZE, WINDOW_INITIAL_SSTHRESH
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -20,24 +20,26 @@ class ReadMode:
     TIMEOUT = 2
 
 class Packet:
-    def __init__(self, seq=0, ack=0, flags=0, payload=b""):
+    def __init__(self, seq=0, ack=0, flags=0, window=0, payload=b""):
         self.seq = seq
         self.ack = ack
         self.flags = flags
+        self.window = window  # New 16-bit Advertised Window field
         self.payload = payload
 
     def encode(self):
-        # Encode the packet header and payload into bytes
-        header = struct.pack("!IIIH", self.seq, self.ack, self.flags, len(self.payload))
+        # Update the struct format string to include window (H) and payload length (H)
+        header = struct.pack("!IIIHH", self.seq, self.ack, self.flags, self.window, len(self.payload))
         return header + self.payload
 
     @staticmethod
     def decode(data):
-        # Decode bytes into a Packet object
-        header_size = struct.calcsize("!IIIH")
-        seq, ack, flags, payload_len = struct.unpack("!IIIH", data[:header_size])
-        payload = data[header_size:]
-        return Packet(seq, ack, flags, payload)
+        # Calculate the new header size with the advertised window field included
+        header_size = struct.calcsize("!IIIHH")
+        seq, ack, flags, window, payload_len = struct.unpack("!IIIHH", data[:header_size])
+        payload = data[header_size: header_size + payload_len]
+        return Packet(seq, ack, flags, window, payload)
+
 
 
 class State(Enum):
@@ -51,6 +53,10 @@ class State(Enum):
     LAST_ACK    = auto()
     CLOSED      = auto()
 
+class TCP_State(Enum):
+    SLOW_START = auto()
+    CONG_AVOID = auto()
+    FAST_RECOV = auto()
 
 class TransportSocket:
     def __init__(self):
@@ -75,15 +81,18 @@ class TransportSocket:
             "send_buf": [],            # Send data buffer
             "sendQ" : [],
             "sws": 3,
-            "LAR": None,
-            "LFS": None
-        }
+            "adv_window": 1,
+            }
         self.sock_type = None
         self.conn = None
         self.my_port = None
 
         # my additions -----------
         self.state = State.LISTEN
+        self.tcp_state = TCP_State.SLOW_START
+        self.dup_ack_cnt = 0
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
         self.close_timer = None
         self.output_buffer = []
         self.data_buffer = []
@@ -99,6 +108,11 @@ class TransportSocket:
         Add a packet to the data_buffer, ensuring the buffer remains sorted by packet sequence number.
         If a packet with the same sequence number already exists, it is ignored.
         """
+        # If buffer is at max capacity, do not append
+        if len(self.data_buffer) >= MAX_NETWORK_BUFFER:
+            print("==> Tried to add recvd packet to full buffer!")
+            return
+
         # If the buffer is empty, simply append.
         if not self.data_buffer:
             self.data_buffer.append(packet)
@@ -127,8 +141,6 @@ class TransportSocket:
         # If not inserted, then packet.seq is greater than all in the buffer; append it.
         if not inserted:
             self.data_buffer.append(packet)
-
-
 
     def socket(self, sock_type, port, server_ip=None):
         """
@@ -301,6 +313,52 @@ class TransportSocket:
 
         return read_len
     
+    def tcp_handle_timeout(self):
+        self.ssthresh = self.cwnd / 2
+        self.cwnd = 1
+        self.dup_ack_cnt = 0
+
+        # todo retransmit missing segment
+
+        self.tcp_state = TCP_State.SLOW_START
+
+        print(f"==>Timeout: {self.tcp_state} cwnd={int(self.cwnd * MSS)} ssthresh={int(self.ssthresh * MSS)}")
+
+    def tcp_handle_dup_ack(self):
+        if self.tcp_state == TCP_State.FAST_RECOV:
+            self.cwnd += 1
+            #todo transmit new segments as allowed
+
+        # If in SLOW_START or CONG_AVOID
+        else:
+            self.dup_ack_cnt += 1
+
+            if(self.dup_ack_cnt == 3):
+                self.ssthresh = self.cwnd / 2
+                self.cwnd = self.ssthresh + 3
+                # todo retransmit missing segment
+
+                self.tcp_state = TCP_State.FAST_RECOV
+
+        print(f"==>Dup ACK: {self.tcp_state} cwnd={int(self.cwnd * MSS)} ssthresh={int(self.ssthresh * MSS)}")
+
+    def tcp_handle_new_ack(self):
+        self.dup_ack_cnt = 0
+
+        if self.tcp_state == TCP_State.FAST_RECOV:
+            self.cwnd = self.ssthresh
+            self.tcp_state = TCP_State.CONG_AVOID
+        # If in SLOW_START or CONG_AVOID
+        else:
+            self.cwnd += 1
+            if self.cwnd >= self.ssthresh and self.state == TCP_State.SLOW_START:
+                self.tcp_state = TCP_State.CONG_AVOID 
+            # todo transmit new segments as allowed
+
+        print(f"==>New ACK: {self.tcp_state} cwnd={int(self.cwnd * MSS)} ssthresh={int(self.ssthresh * MSS)}")
+
+               
+
 
     def send_segment(self, data):
         """
@@ -311,6 +369,14 @@ class TransportSocket:
         offset = 0
         seq = self.window["next_seq_to_send"]
 
+        # todo QUESTIONS: should we go back to slow start every time send_segment is run?
+
+        # Initialize TCP state control variables
+        self.tcp_state = TCP_State.SLOW_START
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE / MSS
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH / MSS
+        self.dup_ack_cnt = 0
+        
         # 1. Segment the data into MSS-sized packets.
         while offset < total_len:
             payload_len = min(MSS, total_len - offset)
@@ -325,21 +391,20 @@ class TransportSocket:
         self.window["next_seq_to_send"] = seq
 
         # Sliding window parameters:
-        sws = self.window["sws"]  # e.g., 3 segments at a time
-        base = 0                 # Index of the first unacknowledged segment
-        next_seg = 0             # Index of the next segment to send
+        base = 0            # Index of the first unacknowledged segment (LAR + 1)
+        LFS = 0             # Index of the next segment to send
 
         # 2. Enter the send loop.
         while base < len(segments):
             # Send segments until the window is full or we've sent all segments.
-            while next_seg < len(segments) and (next_seg - base) < sws:
-                seg = segments[next_seg]
+            while LFS < len(segments) and (LFS - base) < min(self.window["sws"], MAX_NETWORK_BUFFER / MSS, self.window["adv_window"]):
+                seg = segments[LFS]
                 ack_goal = seg.seq + len(seg.payload)
                 # Record the send time for RTT calculations.
                 self.packet_send_times[ack_goal] = time.time()
                 print(f"Sending segment: seq={seg.seq}, len={len(seg.payload)}")
                 self.sock_fd.sendto(seg.encode(), self.conn)
-                next_seg += 1
+                LFS += 1
 
             # 3. Wait for the cumulative ACK for the base segment.
             # The expected ACK value is the base segment's sequence number plus its payload length.
@@ -349,131 +414,17 @@ class TransportSocket:
                 base += 1  # Slide the window forward (cumulative ACK)
             else:
                 # Timeout occurred; retransmit all segments in the window.
+
+                # todo TK timeout event
+                self.tcp_handle_timeout
+
                 print("Timeout: Retransmitting segments in the current window.")
-                for i in range(base, next_seg):
+                for i in range(base, LFS):
                     seg = segments[i]
                     ack_goal = seg.seq + len(seg.payload)
                     self.packet_send_times[ack_goal] = time.time()  # Reset timer
                     print(f"Retransmitting segment: seq={seg.seq}, len={len(seg.payload)}")
                     self.sock_fd.sendto(seg.encode(), self.conn)
-
-
-    # def calibrate_segment_pointers(seg1, seg2, seg3):
-    #     if seg1 + MSS < total_len:
-            
-
-    # def send_segment(self, data):
-    #     """
-    #     Send 'data' in multiple MSS-sized segments and reliably wait for each ACK
-    #     """
-
-    #     # implement pipelining, sending 3 segments at a time
-    #     offset = 0
-    #     total_len = len(data)
-    #     next_seq = self.window["next_seq_to_send"]
-
-    #     SWS = 3
-    #     LAR = -1
-    #     LFS = -1
-    #     timestamp = None
-
-    #     # Create a list of frames ready to send
-    #     while offset < total_len:
-    #         payload_len = min(MSS, total_len - offset)
-    #         seq_no = next_seq
-    #         chunk = data[offset : offset + payload_len]
-
-    #         # todo update ACK value later of course
-    #         frame = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-    #         self.window["send_buf"].append(frame)
-    #         next_seq += payload_len # + 1
-    #         offset += payload_len
-
-    #     # Slowly go through send buffer
-    #     while len(self.window["send_buf"]) > 0:
-    #         # If not all frames in window have been sent
-    #         if LFS - LAR <= SWS:
-    #             segment = self.window["send_buf"][LAR+1]
-    #             segment.ack = self.window["last_ack"]
-    #             self.window["next_seq_to_send"] += segment.payload
-
-    #             self.sock_fd.sendto(segment.encode(), self.conn)
-
-    #             if timestamp is None:
-    #                 timestamp = time.time()
-
-    #     while offset < total_len:
-    #         payload_len = min(MSS, total_len - offset)
-            
-
-    #     # Junkie!
-    #     while offset < total_len:
-    #         payload_len = min(MSS, total_len - offset)
-
-    #         # Current sequence number
-    #         seq_no = self.window["next_seq_to_send"]
-    #         chunk = data[offset : offset + payload_len]
-
-    #         # Create a packet
-    #         segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-
-    #         # We expect an ACK for seq_no + payload_len
-    #         ack_goal = seq_no + payload_len
-
-    #     ack_window = {False, False, False}
-
-    #     # Calibrate segment pointer values
-    #     if MSS < total_len:
-    #         window[2] = total_len
-    #     else:
-    #         window[2] = MSS
-    #         if MSS * 2 < total_len:
-    #             window[3] = total_len
-    #         else:
-    #             window[3] = MSS * 2
-                
-    #     if self.state == State.ESTABLISHED:
-            
-
-    #         for segment in window:
-    #             segment = segment + 3*MSS if segment + 3*MSS < total_len else 0
-                    
-    #     if self.state == State.ESTABLISHED:
-
-    #         # While there's data left to send
-    #         while offset < total_len:
-    #             payload_len = min(MSS, total_len - offset)
-
-    #             # Current sequence number
-    #             seq_no = self.window["next_seq_to_send"]
-    #             chunk = data[offset : offset + payload_len]
-
-    #             # Create a packet
-    #             segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-
-    #             # We expect an ACK for seq_no + payload_len
-    #             ack_goal = seq_no + payload_len
-
-    #             # Record time packet is sent
-    #             self.packet_send_times[ack_goal] = time.time()
-
-    #             while True:
-    #                 print(f"Sending segment (seq={seq_no}, len={payload_len})")
-    #                 self.sock_fd.sendto(segment.encode(), self.conn)
-
-    #                 if self.wait_for_ack(ack_goal):
-    #                     print(f"Segment {seq_no} acknowledged.")
-    #                     # Advance our next_seq_to_send
-    #                     self.window["next_seq_to_send"] += payload_len
-
-    #                     # todo erase data from buffer
-
-    #                     break
-    #                 else:
-    #                     print("Timeout: Retransmitting segment.")
-
-    #             offset += payload_len
-
 
     def wait_for_ack(self, ack_goal):
         """
@@ -507,7 +458,8 @@ class TransportSocket:
         
     def send_ack(self, packet, flags, addr):
         ack_val = packet.seq + len(packet.payload)
-        ack_packet = Packet(seq=packet.ack, ack=ack_val, flags=flags)
+        window = int ( (MAX_NETWORK_BUFFER / MSS) - len(self.data_buffer) ) # todo check this is correct eqn
+        ack_packet = Packet(seq=packet.ack, ack=ack_val, flags=flags, window=window)
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
         self.window["last_ack"] = ack_val
@@ -635,6 +587,13 @@ class TransportSocket:
                             with self.recv_lock:
                                 if packet.ack > self.window["next_seq_expected"]:
                                     self.window["next_seq_expected"] = packet.ack
+                                    self.window["adv_window"] = packet.window # todo TK make sure this is in unit of frames
+                                    # todo TK fsm handle new ACK
+                                    self.tcp_handle_new_ack()
+                                    print(f"New ACK window={packet.window * MSS}")
+                                else:
+                                    # todo TK fsm handle duplicate ACK
+                                    self.tcp_handle_dup_ack
                                 self.wait_cond.notify_all()
                             continue
 
@@ -673,9 +632,6 @@ class TransportSocket:
                             self.wait_cond.notify_all()
                             continue
 
-                            # print(f"====> recv_len={self.window["recv_len"]}")
-                            # print(f"====> recv_buf={self.window["recv_buf"]}")
-
                     case(State.FIN_SENT):
                         # if packet.flags & 0 != 0:
                         #     with self.recv_lock:
@@ -702,7 +658,7 @@ class TransportSocket:
                         #         continue
 
                         # If we get an ACK packet, transition to TIME_WAIT
-                        if packet.flags & ACK_FLAG:
+                        if packet.flags & ACK_FLAG != 0:
                             with self.recv_lock:
                                 print(f"==> {self.state} FIN_SENT Received ACK, transitioning to TIME_WAIT")
 
@@ -719,7 +675,12 @@ class TransportSocket:
                                 self.wait_cond.notify_all()
                                 continue
 
-                        if packet.flags & 0x00 != 0:
+                        # If packet is not FIN or ACK, it must be a data packet atp
+
+                        # run handle packet
+                        # run send ack
+
+                        if packet.flags & 0x00 != 0: # todo: Find out if this works
                             with self.recv_lock:
                                 print("======> FIN_SENT Received data packet. Transitioning to ESTABLISHED")
 
