@@ -396,6 +396,8 @@ class TransportSocket:
 
         # 2. Enter the send loop.
         while base < len(segments):
+            if(self.state != State.ESTABLISHED):
+                    return
             # Send segments until the window is full or we've sent all segments.
             while LFS < len(segments) and (LFS - base) < min(self.window["sws"], MAX_NETWORK_BUFFER / MSS, self.window["adv_window"]):
                 seg = segments[LFS]
@@ -418,7 +420,7 @@ class TransportSocket:
                 # todo TK timeout event
                 self.tcp_handle_timeout
 
-                print("Timeout: Retransmitting segments in the current window.")
+                print("Timeout: Retransmitting segments in the current window.")                
                 for i in range(base, LFS):
                     seg = segments[i]
                     ack_goal = seg.seq + len(seg.payload)
