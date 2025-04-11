@@ -78,7 +78,7 @@ class TransportSocket:
             "recv_len": 0,            # How many bytes are in recv_buf
             "next_seq_to_send": 0,    # The sequence number for the next packet we send
             # my additions -----
-            "send_buf": [],           # Send data buffer
+            "send_buf": [],            # Send data buffer
             "sendQ" : [],
             "sws": 3,
             "adv_window": 1,
@@ -529,7 +529,7 @@ class TransportSocket:
 
                     case(State.SYN_SENT):
 
-                        if time.time() - self.ack_timer > self.est_rtt:
+                        if time.time() - self.ack_timer > self.timeout:
                             self.sock_fd.sendto(self.last_ack_packet.encode(), addr)
                             self.ack_timer = time.time()
 
@@ -560,7 +560,7 @@ class TransportSocket:
 
                     case(State.SYN_RCVD):
 
-                        if time.time() - self.ack_timer > self.est_rtt:
+                        if time.time() - self.ack_timer > self.timeout:
                             self.sock_fd.sendto(self.last_ack_packet.encode(), addr)
                             self.ack_timer = time.time()
 
