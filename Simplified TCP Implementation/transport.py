@@ -529,7 +529,7 @@ class TransportSocket:
 
                     case(State.SYN_SENT):
 
-                        if time.time() - self.ack_timer > self.est_rtt:
+                        if time.time() - self.ack_timer > self.est_rtt and self.ack_timer != -1:
                             self.sock_fd.sendto(self.last_ack_packet.encode(), addr)
                             self.ack_timer = time.time()
 
@@ -560,7 +560,7 @@ class TransportSocket:
 
                     case(State.SYN_RCVD):
 
-                        if time.time() - self.ack_timer > self.est_rtt:
+                        if time.time() - self.ack_timer > self.est_rtt and self.ack_timer != -1:
                             self.sock_fd.sendto(self.last_ack_packet.encode(), addr)
                             self.ack_timer = time.time()
 
